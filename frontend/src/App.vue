@@ -2,7 +2,7 @@
   <el-container class="app-shell">
     <el-header class="header">
       <div>
-        <h1>IB Graph Tool</h1>
+        <h1>All-in-one IB Graph Tool</h1>
         <p>Uncertainty among trials; Linearization; error bar; best fit; max/min line; uncertainty of gradient and intercept; proper decimal/s.f.</p>
       </div>
     </el-header>
