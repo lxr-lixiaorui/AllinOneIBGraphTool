@@ -12,6 +12,7 @@ import time
 import io
 import zipfile
 from xml.sax.saxutils import escape as xml_escape
+import re
 
 app = FastAPI(title="IB Graph Tool API")
 
@@ -105,11 +106,41 @@ def derive_unit(unit: str, expr: str) -> str:
     if sym == 1 / x_sym: return f"({unit})^(-1)"
     return unit
 
+def transform_label(symbol: str, expr: str) -> str:
+    expr = (expr or "x").strip()
+    if expr == "x":
+        return symbol
+    return re.sub(r'(?<![A-Za-z0-9_])x(?![A-Za-z0-9_])', symbol, expr)
+
+def finite_array(values: List[float], label: str) -> np.ndarray:
+    arr = np.array(values, dtype=float)
+    if arr.size == 0:
+        raise HTTPException(status_code=422, detail=f"{label} has no data.")
+    if not np.all(np.isfinite(arr)):
+        bad_rows = [str(i + 1) for i, value in enumerate(arr) if not np.isfinite(value)]
+        shown = ", ".join(bad_rows[:5])
+        suffix = "..." if len(bad_rows) > 5 else ""
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label} contains NaN or Infinity at row(s) {shown}{suffix}. Check linearization domain or overflow.",
+        )
+    return arr
+
 def fit_line(x: List[float], y: List[float]):
-    m, b = np.polyfit(np.array(x, dtype=float), np.array(y, dtype=float), 1)
-    yhat = m * np.array(x) + b
-    ss_res = float(np.sum((np.array(y) - yhat) ** 2))
-    ss_tot = float(np.sum((np.array(y) - np.mean(y)) ** 2))
+    x_arr = finite_array(x, "Linearized X")
+    y_arr = finite_array(y, "Linearized Y")
+    if x_arr.size < 2 or np.unique(x_arr).size < 2:
+        raise HTTPException(status_code=422, detail="At least two different X values are required for linear fit.")
+    try:
+        m, b = np.polyfit(x_arr, y_arr, 1)
+    except np.linalg.LinAlgError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Linear fit failed. Check transformed data for invalid or numerically unstable values. ({exc})",
+        ) from exc
+    yhat = m * x_arr + b
+    ss_res = float(np.sum((y_arr - yhat) ** 2))
+    ss_tot = float(np.sum((y_arr - np.mean(y_arr)) ** 2))
     r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 1.0
     return float(m), float(b), float(r2)
 
@@ -137,10 +168,10 @@ def endpoint_lines(x: List[float], y: List[float], ex: List[float], ey: List[flo
     return max_m, max_b, min_m, min_b
 
 def linprog_extreme_lines(x: List[float], y: List[float], ex: List[float], ey: List[float]):
-    x_arr = np.array(x, dtype=float)
-    y_arr = np.array(y, dtype=float)
-    ex_arr = np.abs(np.array(ex, dtype=float))
-    ey_arr = np.abs(np.array(ey, dtype=float))
+    x_arr = finite_array(x, "Linearized X")
+    y_arr = finite_array(y, "Linearized Y")
+    ex_arr = np.abs(finite_array(ex, "Linearized X uncertainty"))
+    ey_arr = np.abs(finite_array(ey, "Linearized Y uncertainty"))
 
     if x_arr.size < 2:
         raise HTTPException(status_code=422, detail="At least two points are required for max/min lines.")
@@ -224,6 +255,7 @@ def analyze(req: AnalyzeRequest):
 
         tx, ty = float(np.array(x_fn(x0)).item()), float(np.array(y_fn(y0)).item())
         tex, tey = propagated_error_interval(x_fn, x0, ex0), propagated_error_interval(y_fn, y0, ey0)
+        finite_array([tx, ty, tex, tey], f"Transformed row {len(stage2) + 1}")
 
         tx_r, tex_r = round_to_uncertainty(tx, tex) if tex != 0 else (tx, 0.0)
         ty_r, tey_r = round_to_uncertainty(ty, tey) if tey != 0 else (ty, 0.0)
@@ -245,8 +277,8 @@ def analyze(req: AnalyzeRequest):
         "stage1": stage1,
         "stage2": stage2,
         "meta": {
-            "x_label": req.iv_symbol if req.x_transform == "x" else f"f({req.iv_symbol})",
-            "y_label": req.dv_symbol if req.y_transform == "x" else f"f({req.dv_symbol})",
+            "x_label": transform_label(req.iv_symbol, req.x_transform),
+            "y_label": transform_label(req.dv_symbol, req.y_transform),
             "x_unit": derive_unit(req.iv_unit, req.x_transform),
             "y_unit": derive_unit(req.dv_unit, req.y_transform),
         },
