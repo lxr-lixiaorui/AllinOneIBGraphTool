@@ -1,7 +1,11 @@
 import axios from 'axios'
 
+const baseURL = import.meta.env.DEV
+  ? 'http://127.0.0.1:8000'
+  : 'https://graphtool-bk.ruiyuan.me/'
+
 const api = axios.create({
-  baseURL: 'http://127.0.0.1:8000',
+  baseURL,
   timeout: 30000,
 })
 
@@ -21,5 +25,12 @@ export async function importCmbl(file: File) {
 
 export async function exportCmbl(payload: any) {
   const { data } = await api.post('/api/export-cmbl', payload)
+  return data
+}
+
+export async function exportRawTableDocx(payload: any) {
+  const { data } = await api.post('/api/export-raw-table-docx', payload, {
+    responseType: 'blob',
+  })
   return data
 }

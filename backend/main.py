@@ -1,19 +1,23 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from typing import List, Union, Dict, Any
 import numpy as np
 import xml.etree.ElementTree as ET
 import sympy as sp
+from scipy.optimize import linprog
 import math
 import time
+import io
+import zipfile
+from xml.sax.saxutils import escape as xml_escape
 
 app = FastAPI(title="IB Graph Tool API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://graphtool.ruiyuan.me","http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,6 +53,11 @@ class ExportCmblRequest(BaseModel):
     best_fit: dict
     max_line: dict
     min_line: dict
+
+class RawTableDocxRequest(BaseModel):
+    title: str = "Raw data table"
+    headers: List[str]
+    rows: List[List[Any]]
 
 # === 工具函数 ===
 def to_error_list(err: Union[float, List[float]], n: int) -> List[float]:
@@ -127,6 +136,63 @@ def endpoint_lines(x: List[float], y: List[float], ex: List[float], ey: List[flo
     min_m, min_b = line_from_points(min_p1, min_p2)
     return max_m, max_b, min_m, min_b
 
+def linprog_extreme_lines(x: List[float], y: List[float], ex: List[float], ey: List[float]):
+    x_arr = np.array(x, dtype=float)
+    y_arr = np.array(y, dtype=float)
+    ex_arr = np.abs(np.array(ex, dtype=float))
+    ey_arr = np.abs(np.array(ey, dtype=float))
+
+    if x_arr.size < 2:
+        raise HTTPException(status_code=422, detail="At least two points are required for max/min lines.")
+
+    def build_constraints(slope_sign: int):
+        a_ub = []
+        b_ub = []
+        for xi, yi, dxi, dyi in zip(x_arr, y_arr, ex_arr, ey_arr):
+            if slope_sign >= 0:
+                # Positive slopes: lowest at xi - dxi, highest at xi + dxi.
+                a_ub.append([xi - dxi, 1.0])
+                b_ub.append(yi + dyi)
+                a_ub.append([-(xi + dxi), -1.0])
+                b_ub.append(-(yi - dyi))
+            else:
+                # Negative slopes reverse the endpoint roles.
+                a_ub.append([xi + dxi, 1.0])
+                b_ub.append(yi + dyi)
+                a_ub.append([-(xi - dxi), -1.0])
+                b_ub.append(-(yi - dyi))
+        return a_ub, b_ub
+
+    def solve_extreme(maximize: bool, slope_sign: int):
+        objective = [-1.0, 0.0] if maximize else [1.0, 0.0]
+        bounds = [(0.0, None), (None, None)] if slope_sign >= 0 else [(None, 0.0), (None, None)]
+        a_ub, b_ub = build_constraints(slope_sign)
+        return linprog(objective, A_ub=a_ub, b_ub=b_ub, bounds=bounds, method="highs")
+
+    def candidates_for(maximize: bool):
+        candidates = []
+        statuses = []
+        for slope_sign in (1, -1):
+            res = solve_extreme(maximize, slope_sign)
+            statuses.append(res.message)
+            if res.success and np.all(np.isfinite(res.x)):
+                candidates.append((float(res.x[0]), float(res.x[1])))
+        return candidates, statuses
+
+    max_candidates, max_statuses = candidates_for(maximize=True)
+    min_candidates, min_statuses = candidates_for(maximize=False)
+
+    if not max_candidates or not min_candidates:
+        detail = (
+            "No bounded straight max/min line can pass through all error bars. "
+            f"Max solver: {'; '.join(max_statuses)}. Min solver: {'; '.join(min_statuses)}."
+        )
+        raise HTTPException(status_code=422, detail=detail)
+
+    max_m, max_b = max(max_candidates, key=lambda params: params[0])
+    min_m, min_b = min(min_candidates, key=lambda params: params[0])
+    return max_m, max_b, min_m, min_b
+
 def format_eq(m: float, b: float) -> str:
     sign = "+" if b >= 0 else "-"
     return f"y = {m:.4g}x {sign} {abs(b):.4g}"
@@ -169,7 +235,7 @@ def analyze(req: AnalyzeRequest):
     ey_vals = [r["error_y"] for r in stage2]
 
     best_m, best_b, r2 = fit_line(x_vals, y_vals)
-    max_m, max_b, min_m, min_b = endpoint_lines(x_vals, y_vals, ex_vals, ey_vals)
+    max_m, max_b, min_m, min_b = linprog_extreme_lines(x_vals, y_vals, ex_vals, ey_vals)
 
     dm, db = abs(max_m - min_m) / 2, abs(max_b - min_b) / 2
     m_show, dm_show = round_to_uncertainty(best_m, dm) if dm != 0 else (best_m, 0.0)
@@ -193,11 +259,81 @@ def analyze(req: AnalyzeRequest):
         }
     }
 
+def build_docx_table(title: str, headers: List[str], rows: List[List[Any]]) -> bytes:
+    def row(values: List[Any], header: bool = False) -> str:
+        cells = []
+        for value in values:
+            text = "" if value is None else str(value)
+            run_props = "<w:rPr><w:b/></w:rPr>" if header else ""
+            cells.append(
+                "<w:tc>"
+                "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>"
+                f"<w:p><w:r>{run_props}<w:t>{xml_escape(text)}</w:t></w:r></w:p>"
+                "</w:tc>"
+            )
+        return f"<w:tr>{''.join(cells)}</w:tr>"
+
+    table_rows = [row(headers, True)] + [row(r) for r in rows]
+    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Title"/></w:pPr>
+      <w:r><w:t>{xml_escape(title)}</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblStyle w:val="TableGrid"/>
+        <w:tblW w:w="0" w:type="auto"/>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+          <w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+          <w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+          <w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>
+        </w:tblBorders>
+      </w:tblPr>
+      {''.join(table_rows)}
+    </w:tbl>
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
+    </w:sectPr>
+  </w:body>
+</w:document>'''
+
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>'''
+    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>'''
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as docx:
+        docx.writestr("[Content_Types].xml", content_types)
+        docx.writestr("_rels/.rels", rels)
+        docx.writestr("word/document.xml", document_xml)
+    return out.getvalue()
+
+@app.post("/api/export-raw-table-docx")
+def export_raw_table_docx(req: RawTableDocxRequest):
+    content = build_docx_table(req.title, req.headers, req.rows)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": 'attachment; filename="raw_data_table.docx"'}
+    )
+
 import xml.etree.ElementTree as ET
 import os
 
 import re, os
-from fastapi.responses import Response
 
 @app.post("/api/export-cmbl")
 def export_cmbl(req: ExportCmblRequest):

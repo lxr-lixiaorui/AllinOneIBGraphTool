@@ -3,7 +3,7 @@
     <el-header class="header">
       <div>
         <h1>All-in-one IB Graph Tool</h1>
-        <p>Uncertainty among trials; Linearization; error bar; best fit; max/min line; uncertainty of gradient and intercept; proper decimal/s.f.</p>
+        <p>Uncertainty among trials; Linearization; error bar; best fit; max/min line; uncertainty of gradient and intercept; proper decimal/s.f. <a href="https://github.com/lxr-lixiaorui/AllinOneIBGraphTool">Star at Github!</a></p>
       </div>
     </el-header>
 
@@ -91,8 +91,28 @@
 
               <el-space wrap>
                 <el-button type="success" @click="runAnalysis">Analyze</el-button>
-                <el-button @click="downloadStage1">Step 1 CSV</el-button>
-                <el-button @click="downloadStage2">Step 2 CSV</el-button>
+                <el-dropdown split-button @click="downloadRawTable" @command="handleRawExportCommand">
+                  Raw Table {{ rawExportFormat.toUpperCase() }}
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="csv">CSV</el-dropdown-item>
+                      <el-dropdown-item command="docx">DOCX</el-dropdown-item>
+                      <el-dropdown-item command="tex">LaTeX</el-dropdown-item>
+                      <el-dropdown-item divided command="view-tex">View TeX Code</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
+                <el-dropdown split-button @click="downloadStage2Table" @command="handleStage2ExportCommand">
+                  Step 2 {{ stage2ExportFormat.toUpperCase() }}
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="csv">CSV</el-dropdown-item>
+                      <el-dropdown-item command="docx">DOCX</el-dropdown-item>
+                      <el-dropdown-item command="tex">LaTeX</el-dropdown-item>
+                      <el-dropdown-item divided command="view-tex">View TeX Code</el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
                               <el-space wrap>
                 <el-button type="primary" plain @click="downloadCmbl">Export CMBL</el-button>
               </el-space>
@@ -150,12 +170,25 @@
         </el-col>
       </el-row>
     </el-main>
+
+    <el-dialog v-model="texDialogVisible" :title="texDialogTitle" width="720px">
+      <el-input
+        v-model="texDialogCode"
+        type="textarea"
+        readonly
+        :autosize="{ minRows: 14, maxRows: 24 }"
+      />
+      <template #footer>
+        <el-button @click="texDialogVisible = false">Close</el-button>
+        <el-button type="primary" @click="copyTexCode">Copy</el-button>
+      </template>
+    </el-dialog>
   </el-container>
 </template>
 
 <script setup lang="ts">
 import axios from 'axios'
-import { analyze, importCmbl, exportCmbl } from './api'
+import { analyze, importCmbl, exportRawTableDocx } from './api'
 import { nextTick, reactive, ref } from 'vue'
 import Plotly from 'plotly.js-dist-min'
 import { ElMessage } from 'element-plus'
@@ -164,6 +197,14 @@ import { ElMessage } from 'element-plus'
 const activeTab = ref('stage1')
 const plotRef = ref<HTMLDivElement | null>(null)
 const rawMatrix = ref('')
+const rawExportFormat = ref<RawExportFormat>('csv')
+const stage2ExportFormat = ref<RawExportFormat>('csv')
+const texDialogVisible = ref(false)
+const texDialogTitle = ref('TeX Code')
+const texDialogCode = ref('')
+
+type RawExportFormat = 'csv' | 'docx' | 'tex'
+type ExportCommand = RawExportFormat | 'view-tex'
 
 const form = reactive({
   iv_symbol: 'x',
@@ -258,14 +299,10 @@ function drawPlot() {
   const x = p.x
   const minX = Math.min(...x)
   const maxX = Math.max(...x)
-  
-  // 向两边稍微延伸一点画线，不至于线被切断
   const margin = (maxX - minX) * 0.05
   const xLine = [minX - margin, maxX + margin]
 
   const lineY = (m: number, b: number) => xLine.map(v => m * v + b)
-
-  // 拼接轴标签与单位：例如 "lg d (m)" 或者 "T^2 (s^2)"
   const xTitle = meta.x_unit ? `${meta.x_label} (${meta.x_unit})` : meta.x_label
   const yTitle = meta.y_unit ? `${meta.y_label} (${meta.y_unit})` : meta.y_label
 
@@ -305,28 +342,28 @@ function drawPlot() {
       line: { color: '#1e8449', dash: 'dot', width: 2 },
     }
   ], {
-    margin: { l: 80, r: 30, t: 30, b: 80 }, // 增加 left 和 bottom 的边距留给标题
+    margin: { l: 80, r: 30, t: 30, b: 80 },
     xaxis: {
       title: {
         text: xTitle,
         font: { size: 14, family: 'Arial, sans-serif' },
-        standoff: 20 // 让文字离轴线远一点，在下方横着居中
+        standoff: 20,
       },
-      zeroline: false
+      zeroline: false,
     },
     yaxis: {
       title: {
         text: yTitle,
         font: { size: 14, family: 'Arial, sans-serif' },
-        standoff: 20 // 让文字离轴线远一点，在左侧竖着居中
+        standoff: 20,
       },
-      zeroline: false
+      zeroline: false,
     },
-    legend: { 
-      orientation: 'h', 
-      y: 1.1, // 把图例放到图表正上方
+    legend: {
+      orientation: 'h',
+      y: 1.1,
       x: 0.5,
-      xanchor: 'center'
+      xanchor: 'center',
     },
   }, { responsive: true, displayModeBar: true })
 }
@@ -346,12 +383,221 @@ function downloadCsv(rows: any[], filename: string) {
   URL.revokeObjectURL(a.href)
 }
 
-function downloadStage1() {
-  downloadCsv(result.value?.stage1 || [], 'stage1_iv_dv_errors.csv')
+function downloadBlob(content: BlobPart, filename: string, type: string) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
 }
 
-function downloadStage2() {
-  downloadCsv(result.value?.stage2 || [], 'stage2_linearized.csv')
+function csvValue(value: any) {
+  const text = value === null || value === undefined ? '' : String(value)
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
+function getRawTableExportData() {
+  const rows = result.value?.stage1 || []
+  const maxTrials = rows.reduce((max: number, row: any) => {
+    return Math.max(max, Array.isArray(row.trials) ? row.trials.length : 0)
+  }, 0)
+  const headers = ['IV', 'Error IV', 'DV(avg)', 'Error DV']
+  const trialHeaders = Array.from({ length: maxTrials }, (_, i) => `Trial ${i + 1}`)
+  const tableRows = rows.map((row: any) => {
+    const trials = Array.isArray(row.trials) ? row.trials : []
+    return [
+      row.iv,
+      row.error_iv,
+      row.dv,
+      row.error_dv,
+      ...trialHeaders.map((_, i) => trials[i] ?? ''),
+    ]
+  })
+  return { headers: [...headers, ...trialHeaders], rows: tableRows }
+}
+
+function getStage2TableExportData() {
+  const rows = result.value?.stage2 || []
+  return {
+    headers: ['Linearized X', 'Error X', 'Linearized Y', 'Error Y'],
+    rows: rows.map((row: any) => [
+      row.x,
+      row.error_x,
+      row.y,
+      row.error_y,
+    ]),
+  }
+}
+
+function latexValue(value: any) {
+  return (value === null || value === undefined ? '' : String(value))
+    .replace(/\\/g, '\\textbackslash{}')
+    .replace(/&/g, '\\&')
+    .replace(/%/g, '\\%')
+    .replace(/\$/g, '\\$')
+    .replace(/#/g, '\\#')
+    .replace(/_/g, '\\_')
+    .replace(/{/g, '\\{')
+    .replace(/}/g, '\\}')
+    .replace(/~/g, '\\textasciitilde{}')
+    .replace(/\^/g, '\\textasciicircum{}')
+}
+
+function buildSimpleLatexTable(table: { headers: string[], rows: any[][] }, caption: string, label: string) {
+  const columnSpec = table.headers.map(() => 'l').join('')
+  const rows = [
+    `    ${table.headers.map(header => `\\textbf{${latexValue(header)}}`).join(' & ')} \\\\`,
+    '    \\hline',
+    ...table.rows.map(row => `    ${row.map(latexValue).join(' & ')} \\\\`),
+  ]
+
+  return [
+    '\\begin{table}[H]',
+    '  \\centering',
+    `  \\caption{${latexValue(caption)}}`,
+    `  \\label{${label}}`,
+    `  \\begin{tabular}{${columnSpec}}`,
+    '    \\hline',
+    ...rows,
+    '    \\hline',
+    '  \\end{tabular}',
+    '\\end{table}',
+  ].join('\n')
+}
+
+function buildRawTableLatex() {
+  return buildSimpleLatexTable(getRawTableExportData(), 'Raw data table.', 'tab:raw-data')
+}
+
+function buildStage2TableLatex() {
+  return buildSimpleLatexTable(getStage2TableExportData(), 'Linearized data table.', 'tab:linearized-data')
+}
+
+function showTexDialog(title: string, code: string) {
+  texDialogTitle.value = title
+  texDialogCode.value = code
+  texDialogVisible.value = true
+}
+
+async function copyTexCode() {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(texDialogCode.value)
+    } else {
+      const textarea = document.createElement('textarea')
+      textarea.value = texDialogCode.value
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+    ElMessage.success('TeX code copied!')
+  } catch (err: any) {
+    ElMessage.error(err?.message || 'Fail to copy TeX code')
+  }
+}
+
+async function downloadRawTable() {
+  const table = getRawTableExportData()
+  if (!table.rows.length) {
+    ElMessage.warning('Please run analysis first!')
+    return
+  }
+
+  if (rawExportFormat.value === 'csv') {
+    const csv = [
+      table.headers.map(csvValue).join(','),
+      ...table.rows.map(row => row.map(csvValue).join(',')),
+    ].join('\n')
+    downloadBlob(csv, 'raw_data_table.csv', 'text/csv;charset=utf-8;')
+    return
+  }
+
+  if (rawExportFormat.value === 'tex') {
+    downloadBlob(buildRawTableLatex(), 'raw_data_table.tex', 'application/x-tex;charset=utf-8;')
+    return
+  }
+
+  try {
+    const docx = await exportRawTableDocx({
+      title: 'Raw data table',
+      headers: table.headers,
+      rows: table.rows,
+    })
+    downloadBlob(docx, 'raw_data_table.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || err.message || 'Fail to export DOCX')
+  }
+}
+
+function handleRawExportCommand(command: string | number | object) {
+  if (!isExportCommand(command)) return
+  if (command === 'view-tex') {
+    const table = getRawTableExportData()
+    if (!table.rows.length) {
+      ElMessage.warning('Please run analysis first!')
+      return
+    }
+    showTexDialog('Raw Table TeX Code', buildRawTableLatex())
+    return
+  }
+  rawExportFormat.value = command
+  downloadRawTable()
+}
+
+async function downloadStage2Table() {
+  const table = getStage2TableExportData()
+  if (!table.rows.length) {
+    ElMessage.warning('Please run analysis first!')
+    return
+  }
+
+  if (stage2ExportFormat.value === 'csv') {
+    const csv = [
+      table.headers.map(csvValue).join(','),
+      ...table.rows.map(row => row.map(csvValue).join(',')),
+    ].join('\n')
+    downloadBlob(csv, 'stage2_linearized.csv', 'text/csv;charset=utf-8;')
+    return
+  }
+
+  if (stage2ExportFormat.value === 'tex') {
+    downloadBlob(buildStage2TableLatex(), 'stage2_linearized.tex', 'application/x-tex;charset=utf-8;')
+    return
+  }
+
+  try {
+    const docx = await exportRawTableDocx({
+      title: 'Linearized data table',
+      headers: table.headers,
+      rows: table.rows,
+    })
+    downloadBlob(docx, 'stage2_linearized.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+  } catch (err: any) {
+    ElMessage.error(err?.response?.data?.detail || err.message || 'Fail to export DOCX')
+  }
+}
+
+function handleStage2ExportCommand(command: string | number | object) {
+  if (!isExportCommand(command)) return
+  if (command === 'view-tex') {
+    const table = getStage2TableExportData()
+    if (!table.rows.length) {
+      ElMessage.warning('Please run analysis first!')
+      return
+    }
+    showTexDialog('Step 2 TeX Code', buildStage2TableLatex())
+    return
+  }
+  stage2ExportFormat.value = command
+  downloadStage2Table()
+}
+
+function isExportCommand(command: string | number | object): command is ExportCommand {
+  return command === 'csv' || command === 'docx' || command === 'tex' || command === 'view-tex'
 }
 
 async function downloadCmbl() {
@@ -388,4 +634,3 @@ async function downloadCmbl() {
   }
 }
 </script>
-
