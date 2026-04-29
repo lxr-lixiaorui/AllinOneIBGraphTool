@@ -1,357 +1,36 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import os
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
-from typing import List, Union, Dict, Any
-import numpy as np
-import xml.etree.ElementTree as ET
-import sympy as sp
-from scipy.optimize import linprog
-import math
-import time
-import io
-import zipfile
-from xml.sax.saxutils import escape as xml_escape
-import re
+from fastapi.responses import Response
+
+try:
+    from .analysis import analyze_data
+    from .exports.cmbl import build_cmbl
+    from .exports.docx import build_docx_table
+    from .models import AnalyzeRequest, ExportCmblRequest, RawTableDocxRequest
+except ImportError:
+    from analysis import analyze_data
+    from exports.cmbl import build_cmbl
+    from exports.docx import build_docx_table
+    from models import AnalyzeRequest, ExportCmblRequest, RawTableDocxRequest
+
 
 app = FastAPI(title="IB Graph Tool API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://graphtool.ruiyuan.me","http://localhost:5173"],
+    allow_origins=["https://graphtool.ruiyuan.me", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-x_sym = sp.Symbol("x")
-ALLOWED_FUNCS = {
-    "x": x_sym, "sqrt": sp.sqrt, "log": sp.log, "ln": sp.log, 
-    "exp": sp.exp, "sin": sp.sin, "cos": sp.cos, "tan": sp.tan, "Abs": sp.Abs,
-}
 
-class AnalyzeRequest(BaseModel):
-    iv_symbol: str = "x"
-    iv_unit: str = ""
-    dv_symbol: str = "y"
-    dv_unit: str = ""
-    iv_values: List[float]
-    iv_error: Union[float, List[float]] = 0.0
-    dv_trials: List[List[float]]
-    dv_trial_error: float = 0.0
-    x_transform: str = "x"
-    y_transform: str = "x"
-
-class ExportCmblRequest(BaseModel):
-    x_name: str
-    x_unit: str
-    y_name: str
-    y_unit: str
-    x_data: List[float]
-    y_data: List[float]
-    error_x: List[float]
-    error_y: List[float]
-    best_fit: dict
-    max_line: dict
-    min_line: dict
-
-class RawTableDocxRequest(BaseModel):
-    title: str = "Raw data table"
-    headers: List[str]
-    rows: List[List[Any]]
-
-# === 工具函数 ===
-def to_error_list(err: Union[float, List[float]], n: int) -> List[float]:
-    if isinstance(err, list):
-        return [float(v) for v in err]
-    return [float(err)] * n
-
-def round_uncertainty_1sf(u: float) -> float:
-    u = abs(float(u))
-    if u == 0: return 0.0
-    exponent = math.floor(math.log10(u))
-    factor = 10 ** exponent
-    return round(u / factor) * factor
-
-def round_to_uncertainty(value: float, uncertainty: float):
-    if uncertainty == 0: return float(value), 0.0
-    u = round_uncertainty_1sf(uncertainty)
-    exponent = math.floor(math.log10(abs(u)))
-    ndigits = -exponent
-    return round(float(value), ndigits), round(float(u), ndigits)
-
-def parse_expr(expr: str):
-    sym = sp.sympify(expr, locals=ALLOWED_FUNCS)
-    fn = sp.lambdify(x_sym, sym, modules=["numpy"])
-    return sym, fn
-
-def propagated_error_interval(fn, value: float, error: float, samples: int = 401) -> float:
-    error = abs(float(error))
-    if error == 0: return 0.0
-    xs = np.linspace(value - error, value + error, samples)
-    ys = np.array(fn(xs), dtype=float)
-    ys = ys[np.isfinite(ys)]
-    if ys.size == 0: return 0.0
-    return float((ys.max() - ys.min()) / 2.0)
-
-def derive_unit(unit: str, expr: str) -> str:
-    unit = (unit or "").strip()
-    if not unit: return ""
-    sym, _ = parse_expr(expr)
-    if sym == x_sym: return unit
-    if sym.func in (sp.log, sp.exp): return ""
-    if sym.func == sp.sqrt: return f"({unit})^(1/2)"
-    if isinstance(sym, sp.Pow) and sym.base == x_sym and sym.exp.is_number:
-        return f"({unit})^({sp.sstr(sym.exp)})"
-    if sym == 1 / x_sym: return f"({unit})^(-1)"
-    return unit
-
-def transform_label(symbol: str, expr: str) -> str:
-    expr = (expr or "x").strip()
-    if expr == "x":
-        return symbol
-    return re.sub(r'(?<![A-Za-z0-9_])x(?![A-Za-z0-9_])', symbol, expr)
-
-def finite_array(values: List[float], label: str) -> np.ndarray:
-    arr = np.array(values, dtype=float)
-    if arr.size == 0:
-        raise HTTPException(status_code=422, detail=f"{label} has no data.")
-    if not np.all(np.isfinite(arr)):
-        bad_rows = [str(i + 1) for i, value in enumerate(arr) if not np.isfinite(value)]
-        shown = ", ".join(bad_rows[:5])
-        suffix = "..." if len(bad_rows) > 5 else ""
-        raise HTTPException(
-            status_code=422,
-            detail=f"{label} contains NaN or Infinity at row(s) {shown}{suffix}. Check linearization domain or overflow.",
-        )
-    return arr
-
-def fit_line(x: List[float], y: List[float]):
-    x_arr = finite_array(x, "Linearized X")
-    y_arr = finite_array(y, "Linearized Y")
-    if x_arr.size < 2 or np.unique(x_arr).size < 2:
-        raise HTTPException(status_code=422, detail="At least two different X values are required for linear fit.")
-    try:
-        m, b = np.polyfit(x_arr, y_arr, 1)
-    except np.linalg.LinAlgError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Linear fit failed. Check transformed data for invalid or numerically unstable values. ({exc})",
-        ) from exc
-    yhat = m * x_arr + b
-    ss_res = float(np.sum((y_arr - yhat) ** 2))
-    ss_tot = float(np.sum((y_arr - np.mean(y_arr)) ** 2))
-    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else 1.0
-    return float(m), float(b), float(r2)
-
-def endpoint_lines(x: List[float], y: List[float], ex: List[float], ey: List[float]):
-    pts = sorted(zip(x, y, ex, ey), key=lambda t: t[0])
-    x1, y1, ex1, ey1 = pts[0]
-    x2, y2, ex2, ey2 = pts[-1]
-
-    # 【逻辑修复】
-    # Max Line: 第一个点的右下角 -> 最后一个点的左上角
-    max_p1 = (x1 + ex1, y1 - ey1)
-    max_p2 = (x2 - ex2, y2 + ey2)
-    # Min Line: 第一个点的左上角 -> 最后一个点的右下角
-    min_p1 = (x1 - ex1, y1 + ey1)
-    min_p2 = (x2 + ex2, y2 - ey2)
-
-    def line_from_points(p1, p2):
-        if p2[0] == p1[0]: return 0.0, 0.0
-        m = (p2[1] - p1[1]) / (p2[0] - p1[0])
-        b = p1[1] - m * p1[0]
-        return float(m), float(b)
-
-    max_m, max_b = line_from_points(max_p1, max_p2)
-    min_m, min_b = line_from_points(min_p1, min_p2)
-    return max_m, max_b, min_m, min_b
-
-def linprog_extreme_lines(x: List[float], y: List[float], ex: List[float], ey: List[float]):
-    x_arr = finite_array(x, "Linearized X")
-    y_arr = finite_array(y, "Linearized Y")
-    ex_arr = np.abs(finite_array(ex, "Linearized X uncertainty"))
-    ey_arr = np.abs(finite_array(ey, "Linearized Y uncertainty"))
-
-    if x_arr.size < 2:
-        raise HTTPException(status_code=422, detail="At least two points are required for max/min lines.")
-
-    def build_constraints(slope_sign: int):
-        a_ub = []
-        b_ub = []
-        for xi, yi, dxi, dyi in zip(x_arr, y_arr, ex_arr, ey_arr):
-            if slope_sign >= 0:
-                # Positive slopes: lowest at xi - dxi, highest at xi + dxi.
-                a_ub.append([xi - dxi, 1.0])
-                b_ub.append(yi + dyi)
-                a_ub.append([-(xi + dxi), -1.0])
-                b_ub.append(-(yi - dyi))
-            else:
-                # Negative slopes reverse the endpoint roles.
-                a_ub.append([xi + dxi, 1.0])
-                b_ub.append(yi + dyi)
-                a_ub.append([-(xi - dxi), -1.0])
-                b_ub.append(-(yi - dyi))
-        return a_ub, b_ub
-
-    def solve_extreme(maximize: bool, slope_sign: int):
-        objective = [-1.0, 0.0] if maximize else [1.0, 0.0]
-        bounds = [(0.0, None), (None, None)] if slope_sign >= 0 else [(None, 0.0), (None, None)]
-        a_ub, b_ub = build_constraints(slope_sign)
-        return linprog(objective, A_ub=a_ub, b_ub=b_ub, bounds=bounds, method="highs")
-
-    def candidates_for(maximize: bool):
-        candidates = []
-        statuses = []
-        for slope_sign in (1, -1):
-            res = solve_extreme(maximize, slope_sign)
-            statuses.append(res.message)
-            if res.success and np.all(np.isfinite(res.x)):
-                candidates.append((float(res.x[0]), float(res.x[1])))
-        return candidates, statuses
-
-    max_candidates, max_statuses = candidates_for(maximize=True)
-    min_candidates, min_statuses = candidates_for(maximize=False)
-
-    if not max_candidates or not min_candidates:
-        detail = (
-            "No bounded straight max/min line can pass through all error bars. "
-            f"Max solver: {'; '.join(max_statuses)}. Min solver: {'; '.join(min_statuses)}."
-        )
-        raise HTTPException(status_code=422, detail=detail)
-
-    max_m, max_b = max(max_candidates, key=lambda params: params[0])
-    min_m, min_b = min(min_candidates, key=lambda params: params[0])
-    return max_m, max_b, min_m, min_b
-
-def format_eq(m: float, b: float) -> str:
-    sign = "+" if b >= 0 else "-"
-    return f"y = {m:.4g}x {sign} {abs(b):.4g}"
-
-# === API 接口 ===
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
-    n = len(req.iv_values)
-    iv_errors = to_error_list(req.iv_error, n)
-    stage1 = []
+    return analyze_data(req)
 
-    for i in range(n):
-        trials = [float(v) for v in req.dv_trials[i] if v is not None]
-        mean_dv = float(np.mean(trials))
-        range_half = (max(trials) - min(trials)) / 2 if len(trials) > 1 else 0.0
-        dv_err = max(float(req.dv_trial_error), float(range_half))
-
-        iv_val_r, iv_err_r = round_to_uncertainty(req.iv_values[i], iv_errors[i]) if iv_errors[i] != 0 else (req.iv_values[i], 0.0)
-        dv_val_r, dv_err_r = round_to_uncertainty(mean_dv, dv_err) if dv_err != 0 else (mean_dv, 0.0)
-        stage1.append({"iv": iv_val_r, "error_iv": iv_err_r, "dv": dv_val_r, "error_dv": dv_err_r, "trials": trials})
-
-    x_expr, x_fn = parse_expr(req.x_transform)
-    y_expr, y_fn = parse_expr(req.y_transform)
-
-    stage2 = []
-    for row in stage1:
-        x0, ex0 = row["iv"], row["error_iv"]
-        y0, ey0 = row["dv"], row["error_dv"]
-
-        tx, ty = float(np.array(x_fn(x0)).item()), float(np.array(y_fn(y0)).item())
-        tex, tey = propagated_error_interval(x_fn, x0, ex0), propagated_error_interval(y_fn, y0, ey0)
-        finite_array([tx, ty, tex, tey], f"Transformed row {len(stage2) + 1}")
-
-        tx_r, tex_r = round_to_uncertainty(tx, tex) if tex != 0 else (tx, 0.0)
-        ty_r, tey_r = round_to_uncertainty(ty, tey) if tey != 0 else (ty, 0.0)
-        stage2.append({"x": tx_r, "error_x": tex_r, "y": ty_r, "error_y": tey_r})
-
-    x_vals = [r["x"] for r in stage2]
-    ex_vals = [r["error_x"] for r in stage2]
-    y_vals = [r["y"] for r in stage2]
-    ey_vals = [r["error_y"] for r in stage2]
-
-    best_m, best_b, r2 = fit_line(x_vals, y_vals)
-    max_m, max_b, min_m, min_b = linprog_extreme_lines(x_vals, y_vals, ex_vals, ey_vals)
-
-    dm, db = abs(max_m - min_m) / 2, abs(max_b - min_b) / 2
-    m_show, dm_show = round_to_uncertainty(best_m, dm) if dm != 0 else (best_m, 0.0)
-    b_show, db_show = round_to_uncertainty(best_b, db) if db != 0 else (best_b, 0.0)
-
-    return {
-        "stage1": stage1,
-        "stage2": stage2,
-        "meta": {
-            "x_label": transform_label(req.iv_symbol, req.x_transform),
-            "y_label": transform_label(req.dv_symbol, req.y_transform),
-            "x_unit": derive_unit(req.iv_unit, req.x_transform),
-            "y_unit": derive_unit(req.dv_unit, req.y_transform),
-        },
-        "plot": {
-            "x": x_vals, "error_x": ex_vals, "y": y_vals, "error_y": ey_vals,
-            "best_fit": {"m": best_m, "b": best_b, "eq": format_eq(best_m, best_b), "r2": r2},
-            "max_line": {"m": max_m, "b": max_b, "eq": format_eq(max_m, max_b)},
-            "min_line": {"m": min_m, "b": min_b, "eq": format_eq(min_m, min_b)},
-            "reported": {"m": m_show, "dm": dm_show, "b": b_show, "db": db_show}
-        }
-    }
-
-def build_docx_table(title: str, headers: List[str], rows: List[List[Any]]) -> bytes:
-    def row(values: List[Any], header: bool = False) -> str:
-        cells = []
-        for value in values:
-            text = "" if value is None else str(value)
-            run_props = "<w:rPr><w:b/></w:rPr>" if header else ""
-            cells.append(
-                "<w:tc>"
-                "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>"
-                f"<w:p><w:r>{run_props}<w:t>{xml_escape(text)}</w:t></w:r></w:p>"
-                "</w:tc>"
-            )
-        return f"<w:tr>{''.join(cells)}</w:tr>"
-
-    table_rows = [row(headers, True)] + [row(r) for r in rows]
-    document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>
-    <w:p>
-      <w:pPr><w:pStyle w:val="Title"/></w:pPr>
-      <w:r><w:t>{xml_escape(title)}</w:t></w:r>
-    </w:p>
-    <w:tbl>
-      <w:tblPr>
-        <w:tblStyle w:val="TableGrid"/>
-        <w:tblW w:w="0" w:type="auto"/>
-        <w:tblBorders>
-          <w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-          <w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-          <w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-          <w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>
-        </w:tblBorders>
-      </w:tblPr>
-      {''.join(table_rows)}
-    </w:tbl>
-    <w:sectPr>
-      <w:pgSz w:w="11906" w:h="16838"/>
-      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
-    </w:sectPr>
-  </w:body>
-</w:document>'''
-
-    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>'''
-    rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>'''
-
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as docx:
-        docx.writestr("[Content_Types].xml", content_types)
-        docx.writestr("_rels/.rels", rels)
-        docx.writestr("word/document.xml", document_xml)
-    return out.getvalue()
 
 @app.post("/api/export-raw-table-docx")
 def export_raw_table_docx(req: RawTableDocxRequest):
@@ -359,136 +38,16 @@ def export_raw_table_docx(req: RawTableDocxRequest):
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": 'attachment; filename="raw_data_table.docx"'}
+        headers={"Content-Disposition": 'attachment; filename="raw_data_table.docx"'},
     )
 
-import xml.etree.ElementTree as ET
-import os
-
-import re, os
 
 @app.post("/api/export-cmbl")
 def export_cmbl(req: ExportCmblRequest):
     template_path = os.path.join(os.path.dirname(__file__), "template.cmbl")
-    if not os.path.exists(template_path):
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail="template.cmbl not found in backend/")
-
-    with open(template_path, "rb") as f:
-        raw = f.read()
-
-    bom = b'\xef\xbb\xbf' if raw[:3] == b'\xef\xbb\xbf' else b''
-    text = raw[len(bom):].decode('utf-8')
-
-    # ── 辅助函数 ──────────────────────────────────────────────────
-
-    def replace_cells(t: str, col_id: str, values: list) -> str:
-        new_content = "\n" + "\n".join(str(v) for v in values) + "\n"
-        def replacer(block_match):
-            block = block_match.group(0)
-            block = re.sub(
-                r'<ColumnCells>.*?</ColumnCells>',
-                f'<ColumnCells>{new_content}</ColumnCells>',
-                block, flags=re.DOTALL
-            )
-            return block
-        # 关键：\s* 而不是 .*?，确保 <ID> 是 <DataColumn> 的第一个子元素
-        pattern = rf'<DataColumn>\s*<ID>\s*{re.escape(col_id)}\s*</ID>.*?</DataColumn>'
-        return re.sub(pattern, replacer, t, flags=re.DOTALL)
-
-    def replace_tag_in_col(t: str, col_id: str, tag: str, new_val: str) -> str:
-        def replacer(block_match):
-            block = block_match.group(0)
-            block = re.sub(
-                rf'(<{tag}>)(.*?)(</{tag}>)',
-                lambda m: m.group(1) + new_val + m.group(3),
-                block, flags=re.DOTALL
-            )
-            return block
-        pattern = rf'<DataColumn>\s*<ID>\s*{re.escape(col_id)}\s*</ID>.*?</DataColumn>'
-        return re.sub(pattern, replacer, t, flags=re.DOTALL)
-
-    def replace_coeff(t: str, func_id: str, m_val: float, b_val: float) -> str:
-        def replacer(block_match):
-            block = block_match.group(0)
-            block = re.sub(
-                r'(<FunctionCoefficientArray>)(.*?)(</FunctionCoefficientArray>)',
-                lambda mm: mm.group(1) + f"2 {m_val} {b_val} " + mm.group(3),
-                block, flags=re.DOTALL
-            )
-            return block
-        # FunctionModel 同理，<ID> 也是第一个子元素
-        pattern = rf'<FunctionModel>\s*<ID>\s*{re.escape(func_id)}\s*</ID>.*?</FunctionModel>'
-        return re.sub(pattern, replacer, t, flags=re.DOTALL)
-
-    def replace_tag_in_func(t: str, func_id: str, tag: str, new_val: str) -> str:
-        def replacer(block_match):
-            block = block_match.group(0)
-            block = re.sub(
-                rf'(<{tag}>)(.*?)(</{tag}>)',
-                lambda m: m.group(1) + new_val + m.group(3),
-                block, flags=re.DOTALL
-            )
-            return block
-        pattern = rf'<FunctionModel>\s*<ID>\s*{re.escape(func_id)}\s*</ID>.*?</FunctionModel>'
-        return re.sub(pattern, replacer, t, flags=re.DOTALL)
-
-    # ── 替换数据 ──────────────────────────────────────────────────
-
-    # 1. 数据列 (102=X, 104=Y)
-    text = replace_cells(text, "102", req.x_data)
-    text = replace_cells(text, "104", req.y_data)
-
-    # 2. 误差列 (115=ErrorX, 118=ErrorY)
-    text = replace_cells(text, "115", req.error_x)
-    text = replace_cells(text, "118", req.error_y)
-
-    # 3. X 列名称和单位
-    text = replace_tag_in_col(text, "102", "DataObjectName", req.x_name)
-    text = replace_tag_in_col(text, "102", "DataObjectShortName", req.x_name[:8])
-    text = replace_tag_in_col(text, "102", "ColumnUnits", req.x_unit)
-
-    # 4. Y 列名称和单位
-    text = replace_tag_in_col(text, "104", "DataObjectName", req.y_name)
-    text = replace_tag_in_col(text, "104", "DataObjectShortName", req.y_name[:8])
-    text = replace_tag_in_col(text, "104", "ColumnUnits", req.y_unit)
-
-    # 5. 误差列单位（与主列保持一致）
-    text = replace_tag_in_col(text, "115", "ColumnUnits", req.x_unit)
-    text = replace_tag_in_col(text, "118", "ColumnUnits", req.y_unit)
-
-    # 6. 三条拟合线系数 (110=Best Fit, 158=Max Line, 161=Min Line)
-    text = replace_coeff(text, "110", req.best_fit["m"], req.best_fit["b"])
-    text = replace_coeff(text, "158", req.max_line["m"], req.max_line["b"])
-    text = replace_coeff(text, "161", req.min_line["m"], req.min_line["b"])
-
-    # 7. 拟合线名称（让 Logger Pro 里显示正确）
-    text = replace_tag_in_func(text, "110", "DataObjectName", "Best Fit")
-    text = replace_tag_in_func(text, "158", "DataObjectName", "Max Line")
-    text = replace_tag_in_func(text, "161", "DataObjectName", "Min Line")
-
-    # 8. 更新 ManualCurveFitIncrements 为合理步长（m和b各取值的1%）
-    def replace_manual_increments(t: str, helper_fit_id: str, m_val: float, b_val: float) -> str:
-        m_step = max(abs(m_val) * 0.01, 0.001)
-        b_step = max(abs(b_val) * 0.01, 0.001)
-        def replacer(block_match):
-            block = block_match.group(0)
-            block = re.sub(
-                r'(<ManualCurveFitIncrements>)(.*?)(</ManualCurveFitIncrements>)',
-                lambda mm: mm.group(1) + f"2 {m_step:.4f} {b_step:.4f} " + mm.group(3),
-                block, flags=re.DOTALL
-            )
-            return block
-        pattern = rf'<PageHelperDataCurveFit>.*?<CurveFitFunctionID>{re.escape(helper_fit_id)}</CurveFitFunctionID>.*?</PageHelperDataCurveFit>'
-        return re.sub(pattern, replacer, t, flags=re.DOTALL)
-
-    text = replace_manual_increments(text, "158", req.max_line["m"], req.max_line["b"])
-    text = replace_manual_increments(text, "161", req.min_line["m"], req.min_line["b"])
-
-    # ── 输出 ──────────────────────────────────────────────────────
-    output = bom + text.encode('utf-8')
+    output = build_cmbl(req, template_path)
     return Response(
         content=output,
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{req.y_name}_vs_{req.x_name}.cmbl"'}
+        headers={"Content-Disposition": f'attachment; filename="{req.y_name}_vs_{req.x_name}.cmbl"'},
     )
